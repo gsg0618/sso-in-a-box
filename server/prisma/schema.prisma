@@ -1,0 +1,141 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A tenant. Every other row in the system hangs off exactly one organization.
+model Organization {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+
+  users         User[]
+  tasks         Task[]
+  sessions      Session[]
+  ssoConnection SsoConnection?
+}
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+/// Users belong to exactly one organization. The same email in two tenants is two
+/// separate accounts, so a tenant's IdP can never assert its way into another tenant.
+model User {
+  id           String   @id @default(uuid())
+  orgId        String
+  email        String
+  name         String
+  role         Role     @default(MEMBER)
+  /// Null for users who only sign in through SSO.
+  passwordHash String?
+  /// Stable subject from the IdP (OIDC `sub` or SAML NameID), set on first SSO login.
+  ssoSubject   String?
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  org           Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sessions      Session[]
+  createdTasks  Task[]       @relation("createdBy")
+  assignedTasks Task[]       @relation("assignee")
+
+  @@unique([orgId, email])
+  @@unique([orgId, ssoSubject])
+  /// Lets other tables use a composite foreign key that pins a user to the same tenant.
+  @@unique([id, orgId])
+}
+
+model Session {
+  /// SHA-256 of the cookie value. The raw token only ever lives in the browser.
+  tokenHash String   @id
+  userId    String
+  orgId     String
+  /// "password" | "oidc" | "saml"
+  method    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User         @relation(fields: [userId, orgId], references: [id, orgId], onDelete: Cascade)
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+model Task {
+  id          String     @id @default(uuid())
+  orgId       String
+  title       String
+  status      TaskStatus @default(TODO)
+  createdById String
+  assigneeId  String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  /// Composite keys: the database itself refuses a task whose creator or assignee is in another tenant.
+  createdBy User         @relation("createdBy", fields: [createdById, orgId], references: [id, orgId], onDelete: Cascade)
+  assignee  User?        @relation("assignee", fields: [assigneeId, orgId], references: [id, orgId])
+
+  @@index([orgId])
+}
+
+enum SsoType {
+  OIDC
+  SAML
+}
+
+/// One SSO connection per tenant, configured by that tenant's admin.
+model SsoConnection {
+  id      String  @id @default(uuid())
+  orgId   String  @unique
+  type    SsoType
+  enabled Boolean @default(false)
+  /// When true, members must use SSO. Admins keep password login as a break-glass path.
+  enforced Boolean @default(false)
+  /// Email domains routed to this connection from the login page. Globally unique (checked in code).
+  domains String[]
+
+  // OIDC
+  oidcIssuer          String?
+  oidcClientId        String?
+  /// AES-256-GCM ciphertext, never returned by the API.
+  oidcClientSecretEnc String?
+
+  // SAML
+  samlIdpEntityId       String?
+  samlIdpSsoUrl         String?
+  samlIdpCertificate    String?
+  /// Accept responses that were not requested by us (IdP dashboard tiles). Off by default.
+  samlAllowIdpInitiated Boolean @default(false)
+
+  updatedAt DateTime @updatedAt
+
+  org          Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  samlCache    SamlCacheEntry[]
+}
+
+/// Short-lived SAML bookkeeping: AuthnRequest IDs we issued (so a response is only accepted if we
+/// asked for it, once) and assertion IDs we have already seen (so a captured response cannot be replayed).
+model SamlCacheEntry {
+  connectionId String
+  key          String
+  value        String
+  expiresAt    DateTime
+
+  connection SsoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@id([connectionId, key])
+  @@index([expiresAt])
+}
